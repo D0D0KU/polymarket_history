@@ -1,0 +1,55 @@
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: polymarket-postgres
+    restart: unless-stopped
+
+    command: ["postgres", "-p", "${POSTGRES_PORT}"]
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+    ports:
+      - "${POSTGRES_PORT}:${POSTGRES_PORT}"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} -p ${POSTGRES_PORT}"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: polymarket-history
+    restart: "no"
+
+    environment:
+      ANKR_KEY: ${ANKR_KEY}
+      RPC_URL: ${RPC_URL}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:${POSTGRES_PORT}/${POSTGRES_DB}
+
+      WALLET: ${WALLET}
+      START_BLOCK: ${START_BLOCK}
+      CHUNK_SIZE: ${CHUNK_SIZE}
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+
+volumes:
+  postgres_data:
