@@ -1,9 +1,35 @@
+import logging
+import time
+from collections import defaultdict
 from typing import Any
 
 from web3 import Web3
 
+from app.blockchain.abis import ERC20_ABI, ERC1155_ABI
 from app.blockchain.client import w3
 from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+RANGE_HINTS = (
+    "too large",
+    "block range",
+    "response size",
+    "query returned more",
+    "more than",
+    "exceeds the max",
+    "log response",
+    "-32005",
+)
+
+ERC20_TRANSFER = "Transfer(address,address,uint256)"
+CTF_SINGLE = (
+    "TransferSingle(address,address,address,uint256,uint256)"
+)
+CTF_BATCH = (
+    "TransferBatch(address,address,address,uint256[],uint256[])"
+)
 
 
 def hx(v: Any) -> str:
@@ -25,392 +51,211 @@ def topic_sig(sig: str) -> str:
     return hx(w3.keccak(text=sig))
 
 
+def transfer_direction(from_addr: str, to_addr: str) -> str:
+    wallet = settings.wallet.lower()
+    source = from_addr.lower()
+    dest = to_addr.lower()
+    if source == wallet and dest == wallet:
+        return "self"
+    if dest == wallet:
+        return "in"
+    return "out"
+
+
+def collapse_token_amounts(
+    pairs: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    totals: dict[int, int] = defaultdict(int)
+    order: list[int] = []
+    for token_id, amount in pairs:
+        if token_id not in totals:
+            order.append(token_id)
+        totals[token_id] += int(amount)
+    return [
+        (token_id, totals[token_id]) for token_id in order
+    ]
+
+
 def get_logs(
     from_b: int,
     to_b: int,
     address: str,
     topics: list,
 ) -> list:
+    delay = 1.0
+    last_exc: Exception | None = None
+    payload = {
+        "fromBlock": from_b,
+        "toBlock": to_b,
+        "address": Web3.to_checksum_address(address),
+        "topics": topics,
+    }
 
-    try:
-        return w3.eth.get_logs(
-            {
-                "fromBlock": from_b,
-                "toBlock": to_b,
-                "address": Web3.to_checksum_address(address),
-                "topics": topics,
-            }
-        )
-
-    except Exception as exc:
-
-        if to_b - from_b <= 0:
-            print(
-                f"RPC error {from_b}-{to_b}: {exc}"
+    for attempt in range(settings.rpc_retries):
+        try:
+            return list(w3.eth.get_logs(payload))
+        except Exception as exc:
+            last_exc = exc
+            text = str(exc).lower()
+            can_split = from_b < to_b and (
+                "-32062" in text
+                or any(hint in text for hint in RANGE_HINTS)
             )
-            return []
-
-        mid = (from_b + to_b) // 2
-
-        print(
-            f"RPC error {from_b}-{to_b}: {exc}"
-        )
-
-        print(
-            f"Splitting at {mid}"
-        )
-
-        return (
-            get_logs(
+            if can_split:
+                mid = (from_b + to_b) // 2
+                logger.warning(
+                    "RPC range %s-%s, split at %s: %s",
+                    from_b,
+                    to_b,
+                    mid,
+                    exc,
+                )
+                return get_logs(
+                    from_b, mid, address, topics
+                ) + get_logs(
+                    mid + 1, to_b, address, topics
+                )
+            logger.warning(
+                "RPC retry %s/%s %s-%s: %s",
+                attempt + 1,
+                settings.rpc_retries,
                 from_b,
-                mid,
-                address,
-                topics,
-            )
-            +
-            get_logs(
-                mid + 1,
                 to_b,
-                address,
-                topics,
+                exc,
             )
-        )
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+
+    raise RuntimeError(
+        f"RPC getLogs failed {from_b}-{to_b} {address}: {last_exc}"
+    ) from last_exc
 
 
-def fetch_pusd(
+def fetch_erc20(
+    token: str,
+    token_address: str,
     start: int,
     end: int,
 ) -> list[dict]:
-
-    events = []
-
-    wallet_topic = topic_addr(settings.wallet)
-
-    signature = topic_sig(
-        "Transfer(address,address,uint256)"
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(token_address),
+        abi=ERC20_ABI,
     )
+    signature = topic_sig(ERC20_TRANSFER)
+    wallet_topic = topic_addr(settings.wallet)
+    events: list[dict] = []
+    seen: set[tuple[str, int]] = set()
 
-    queries = [
+    for topics in (
         [signature, wallet_topic, None],
         [signature, None, wallet_topic],
-    ]
+    ):
+        for log in get_logs(start, end, token_address, topics):
+            key = (hx(log["transactionHash"]), int(log["logIndex"]))
+            if key in seen:
+                continue
+            seen.add(key)
 
-    for topics in queries:
-
-        current = start
-
-        while current <= end:
-
-            to_block = min(
-                current + settings.chunk_size - 1,
-                end,
+            args = contract.events.Transfer().process_log(log)["args"]
+            events.append(
+                {
+                    "type": "erc20",
+                    "token": token,
+                    "token_address": token_address,
+                    "block": int(log["blockNumber"]),
+                    "tx": key[0],
+                    "log_index": key[1],
+                    "from": args["from"],
+                    "to": args["to"],
+                    "token_id": "",
+                    "amount_raw": int(args["value"]),
+                    "dir": transfer_direction(
+                        args["from"],
+                        args["to"],
+                    ),
+                }
             )
 
-            logs = get_logs(
-                current,
-                to_block,
-                settings.pusd_address,
-                topics,
-            )
+    return events
 
-            contract = w3.eth.contract(
-                address=Web3.to_checksum_address(
-                    settings.pusd_address
-                ),
-                abi=[
-                    {
-                        "anonymous": False,
-                        "inputs": [
-                            {
-                                "indexed": True,
-                                "name": "from",
-                                "type": "address",
-                            },
-                            {
-                                "indexed": True,
-                                "name": "to",
-                                "type": "address",
-                            },
-                            {
-                                "indexed": False,
-                                "name": "value",
-                                "type": "uint256",
-                            },
-                        ],
-                        "name": "Transfer",
-                        "type": "event",
-                    }
-                ],
-            )
 
-            for log in logs:
+def fetch_ctf(start: int, end: int) -> list[dict]:
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(settings.ctf_address),
+        abi=ERC1155_ABI,
+    )
+    wallet_topic = topic_addr(settings.wallet)
+    single = topic_sig(CTF_SINGLE)
+    batch = topic_sig(CTF_BATCH)
+    events: list[dict] = []
+    seen: set[tuple[str, int, str]] = set()
 
-                try:
-                    args = (
-                        contract.events.Transfer()
-                        .process_log(log)["args"]
+    queries = (
+        (True, [single, None, wallet_topic, None]),
+        (True, [single, None, None, wallet_topic]),
+        (False, [batch, None, wallet_topic, None]),
+        (False, [batch, None, None, wallet_topic]),
+    )
+
+    for is_single, topics in queries:
+        for log in get_logs(
+            start, end, settings.ctf_address, topics
+        ):
+            tx = hx(log["transactionHash"])
+            log_index = int(log["logIndex"])
+
+            if is_single:
+                args = (
+                    contract.events.TransferSingle()
+                    .process_log(log)["args"]
+                )
+                items = [(int(args["id"]), int(args["value"]))]
+            else:
+                args = (
+                    contract.events.TransferBatch()
+                    .process_log(log)["args"]
+                )
+                items = collapse_token_amounts(
+                    list(
+                        zip(
+                            map(int, args["ids"]),
+                            map(int, args["values"]),
+                        )
                     )
-                except Exception:
+                )
+
+            direction = transfer_direction(
+                args["from"],
+                args["to"],
+            )
+
+            for token_id, raw in items:
+                key = (tx, log_index, str(token_id))
+                if key in seen:
                     continue
-
-                raw = int(args["value"])
-
+                seen.add(key)
                 events.append(
                     {
-                        "type": "erc20",
-                        "token": "pUSD",
-                        "token_address": settings.pusd_address,
-                        "block": log["blockNumber"],
-                        "tx": hx(log["transactionHash"]),
-                        "log_index": log["logIndex"],
+                        "type": "erc1155",
+                        "token": "CTF",
+                        "token_address": settings.ctf_address,
+                        "block": int(log["blockNumber"]),
+                        "tx": tx,
+                        "log_index": log_index,
                         "from": args["from"],
                         "to": args["to"],
+                        "token_id": str(token_id),
                         "amount_raw": raw,
-                        "dir": (
-                            "in"
-                            if args["to"].lower()
-                            == settings.wallet.lower()
-                            else "out"
-                        ),
+                        "dir": direction,
                     }
                 )
 
-            current = to_block + 1
-
-    print(f" pUSD pass done → {end}")
-
     return events
 
 
-def fetch_ctf(
-    start: int,
-    end: int,
-) -> list[dict]:
-
-    events = []
-
-    wallet_topic = topic_addr(settings.wallet)
-
-    single = topic_sig(
-        "TransferSingle(address,address,address,uint256,uint256)"
-    )
-
-    batch = topic_sig(
-        "TransferBatch(address,address,address,uint256[],uint256[])"
-    )
-
-    contract = w3.eth.contract(
-        address=Web3.to_checksum_address(
-            settings.ctf_address
-        ),
-        abi=[
-            {
-                "anonymous": False,
-                "inputs": [
-                    {
-                        "indexed": True,
-                        "name": "operator",
-                        "type": "address",
-                    },
-                    {
-                        "indexed": True,
-                        "name": "from",
-                        "type": "address",
-                    },
-                    {
-                        "indexed": True,
-                        "name": "to",
-                        "type": "address",
-                    },
-                    {
-                        "indexed": False,
-                        "name": "id",
-                        "type": "uint256",
-                    },
-                    {
-                        "indexed": False,
-                        "name": "value",
-                        "type": "uint256",
-                    },
-                ],
-                "name": "TransferSingle",
-                "type": "event",
-            },
-            {
-                "anonymous": False,
-                "inputs": [
-                    {
-                        "indexed": True,
-                        "name": "operator",
-                        "type": "address",
-                    },
-                    {
-                        "indexed": True,
-                        "name": "from",
-                        "type": "address",
-                    },
-                    {
-                        "indexed": True,
-                        "name": "to",
-                        "type": "address",
-                    },
-                    {
-                        "indexed": False,
-                        "name": "ids",
-                        "type": "uint256[]",
-                    },
-                    {
-                        "indexed": False,
-                        "name": "values",
-                        "type": "uint256[]",
-                    },
-                ],
-                "name": "TransferBatch",
-                "type": "event",
-            },
-        ],
-    )
-
-    queries = [
-        (
-            single,
-            [single, None, wallet_topic, None],
-            True,
-        ),
-        (
-            single,
-            [single, None, None, wallet_topic],
-            True,
-        ),
-        (
-            batch,
-            [batch, None, wallet_topic, None],
-            False,
-        ),
-        (
-            batch,
-            [batch, None, None, wallet_topic],
-            False,
-        ),
-    ]
-
-    for signature, topics, is_single in queries:
-
-        current = start
-
-        while current <= end:
-
-            to_block = min(
-                current + settings.chunk_size - 1,
-                end,
-            )
-
-            logs = get_logs(
-                current,
-                to_block,
-                settings.ctf_address,
-                topics,
-            )
-
-            for log in logs:
-
-                try:
-
-                    if is_single:
-
-                        args = (
-                            contract.events.TransferSingle()
-                            .process_log(log)["args"]
-                        )
-
-                        items = [
-                            (
-                                int(args["id"]),
-                                int(args["value"]),
-                            )
-                        ]
-
-                    else:
-
-                        args = (
-                            contract.events.TransferBatch()
-                            .process_log(log)["args"]
-                        )
-
-                        items = list(
-                            zip(
-                                map(int, args["ids"]),
-                                map(int, args["values"]),
-                            )
-                        )
-
-                    from_address = args["from"]
-                    to_address = args["to"]
-
-                except Exception:
-                    continue
-
-                direction = (
-                    "in"
-                    if to_address.lower()
-                    == settings.wallet.lower()
-                    else "out"
-                )
-
-                for token_id, raw in items:
-
-                    events.append(
-                        {
-                            "type": "erc1155",
-                            "token": "CTF",
-                            "token_address": settings.ctf_address,
-                            "block": log["blockNumber"],
-                            "tx": hx(log["transactionHash"]),
-                            "log_index": log["logIndex"],
-                            "from": from_address,
-                            "to": to_address,
-                            "token_id": str(token_id),
-                            "amount_raw": raw,
-                            "dir": direction,
-                        }
-                    )
-
-            current = to_block + 1
-
-    print(f" CTF pass done → {end}")
-
+def scan_chunk(start: int, end: int) -> list[dict]:
+    events: list[dict] = []
+    for token, address in settings.erc20_tokens:
+        events.extend(fetch_erc20(token, address, start, end))
+    events.extend(fetch_ctf(start, end))
     return events
-
-
-def scan_blocks() -> list[dict]:
-
-    latest_block = w3.eth.block_number
-
-    print(f"Latest block: {latest_block}")
-
-    pusd_events = fetch_pusd(
-        settings.start_block,
-        latest_block,
-    )
-
-    ctf_events = fetch_ctf(
-        settings.start_block,
-        latest_block,
-    )
-
-    events = pusd_events + ctf_events
-    
-    unique = {}
-
-    for event in events:
-
-        key = (
-            event["tx"].lower(),
-            event["log_index"],
-            event["token"],
-            event.get("token_id", ""),
-        )
-
-        unique[key] = event
-
-    return list(unique.values())

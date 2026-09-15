@@ -5,7 +5,7 @@ from app.config import settings
 
 w3 = Web3(
     Web3.HTTPProvider(
-        settings.rpc_url,
+        settings.rpc_endpoint,
         request_kwargs={
             "timeout": 60,
         },

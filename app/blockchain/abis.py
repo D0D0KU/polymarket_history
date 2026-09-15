@@ -127,4 +127,25 @@ ERC1155_ABI = [
         "stateMutability": "view",
         "type": "function",
     },
+    {
+        "inputs": [
+            {
+                "name": "accounts",
+                "type": "address[]",
+            },
+            {
+                "name": "ids",
+                "type": "uint256[]",
+            },
+        ],
+        "name": "balanceOfBatch",
+        "outputs": [
+            {
+                "name": "",
+                "type": "uint256[]",
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function",
+    },
 ]

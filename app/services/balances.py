@@ -10,10 +10,12 @@ from app.config import settings
 from app.db.models import (
     WalletBalance,
     WalletBalanceOnchain,
+    WalletEvent,
 )
 
 
 DECIMALS = 6
+CTF_BATCH_SIZE = 100
 
 
 def human(raw: int) -> Decimal:
@@ -23,156 +25,125 @@ def human(raw: int) -> Decimal:
 def balances_from_events(
     events: list[dict],
 ) -> dict[tuple[str, str, str], int]:
+    balances: dict[tuple[str, str, str], int] = defaultdict(int)
 
-    balances = defaultdict(int)
-
-    for event in sorted(
-        events,
-        key=lambda x: (
-            x["block"],
-            x["log_index"],
-        ),
-    ):
-
-        token = event["token"]
-
-        token_address = event[
-            "token_address"
-        ].lower()
-
-        token_id = event.get(
-            "token_id",
-            "",
-        )
-
+    for event in events:
         key = (
-            token,
-            token_address,
-            token_id,
+            event["token"],
+            event["token_address"].lower(),
+            event.get("token_id") or "",
         )
-
         raw = int(event["amount_raw"])
-
         if event["dir"] == "in":
             balances[key] += raw
-        else:
+        elif event["dir"] == "out":
             balances[key] -= raw
+
+    for token, address in settings.erc20_tokens:
+        balances.setdefault((token, address.lower(), ""), 0)
 
     return dict(balances)
 
 
-def balances_onchain() -> dict:
-
-    wallet = Web3.to_checksum_address(
-        settings.wallet
+def balances_from_db(session: Session) -> dict[tuple[str, str, str], int]:
+    rows = (
+        session.query(WalletEvent)
+        .filter(WalletEvent.wallet == settings.wallet.lower())
+        .all()
     )
+    events = [
+        {
+            "token": row.token,
+            "token_address": row.token_address,
+            "token_id": row.token_id or "",
+            "amount_raw": int(row.amount_raw),
+            "dir": row.direction,
+        }
+        for row in rows
+    ]
+    return balances_from_events(events)
 
-    result = {}
 
-    pusd = w3.eth.contract(
-        address=Web3.to_checksum_address(
-            settings.pusd_address
-        ),
-        abi=ERC20_ABI,
-    )
-
-    raw = pusd.functions.balanceOf(
-        wallet
-    ).call()
-
-    result[
-        (
-            "pUSD",
-            settings.pusd_address.lower(),
-            "",
+def ctf_token_ids_from_db(session: Session) -> list[str]:
+    rows = (
+        session.query(WalletEvent.token_id)
+        .filter(
+            WalletEvent.wallet == settings.wallet.lower(),
+            WalletEvent.token == "CTF",
+            WalletEvent.token_id != "",
         )
-    ] = int(raw)
-
-    return result
-
-
-def balances_onchain_for_token_ids(
-    token_ids: set[str],
-) -> dict:
-
-    wallet = Web3.to_checksum_address(
-        settings.wallet
+        .distinct()
+        .all()
     )
+    return [row[0] for row in rows]
+
+
+def balances_onchain(block: int, token_ids: list[str]) -> dict:
+    wallet = Web3.to_checksum_address(settings.wallet)
+    result: dict[tuple[str, str, str], int] = {}
+
+    for token, address in settings.erc20_tokens:
+        contract = w3.eth.contract(
+            address=Web3.to_checksum_address(address),
+            abi=ERC20_ABI,
+        )
+        raw = contract.functions.balanceOf(wallet).call(
+            block_identifier=block
+        )
+        result[(token, address.lower(), "")] = int(raw)
+
+    if not token_ids:
+        return result
 
     ctf = w3.eth.contract(
-        address=Web3.to_checksum_address(
-            settings.ctf_address
-        ),
+        address=Web3.to_checksum_address(settings.ctf_address),
         abi=ERC1155_ABI,
     )
+    ctf_address = settings.ctf_address.lower()
+    ids = [str(token_id) for token_id in token_ids]
 
-    result = {}
-
-    for token_id in token_ids:
-
-        raw = ctf.functions.balanceOf(
-            wallet,
-            int(token_id),
-        ).call()
-
-        result[
-            (
-                "CTF",
-                settings.ctf_address.lower(),
-                str(token_id),
-            )
-        ] = int(raw)
+    for offset in range(0, len(ids), CTF_BATCH_SIZE):
+        chunk = ids[offset : offset + CTF_BATCH_SIZE]
+        accounts = [wallet] * len(chunk)
+        values = ctf.functions.balanceOfBatch(
+            accounts,
+            [int(token_id) for token_id in chunk],
+        ).call(block_identifier=block)
+        for token_id, raw in zip(chunk, values):
+            result[("CTF", ctf_address, token_id)] = int(raw)
 
     return result
 
 
-def save_historical_balances(
-    session: Session,
-    balances: dict,
-) -> None:
-
-    for (
-        token,
-        token_address,
-        token_id,
-    ), raw in balances.items():
-
-        item = WalletBalance(
-            wallet=settings.wallet.lower(),
-            token=token,
-            token_address=token_address,
-            token_id=token_id,
-            balance_raw=raw,
-            balance=human(raw),
+def save_historical_balances(session: Session, balances: dict) -> None:
+    wallet = settings.wallet.lower()
+    for (token, token_address, token_id), raw in balances.items():
+        session.merge(
+            WalletBalance(
+                wallet=wallet,
+                token=token,
+                token_address=token_address,
+                token_id=token_id,
+                balance_raw=raw,
+                balance=human(raw),
+            )
         )
-
-        session.merge(item)
-
     session.commit()
 
 
-def save_onchain_balances(
-    session: Session,
-    balances: dict,
-) -> None:
-
-    for (
-        token,
-        token_address,
-        token_id,
-    ), raw in balances.items():
-
-        item = WalletBalanceOnchain(
-            wallet=settings.wallet.lower(),
-            token=token,
-            token_address=token_address,
-            token_id=token_id,
-            balance_raw=raw,
-            balance=human(raw),
+def save_onchain_balances(session: Session, balances: dict) -> None:
+    wallet = settings.wallet.lower()
+    for (token, token_address, token_id), raw in balances.items():
+        session.merge(
+            WalletBalanceOnchain(
+                wallet=wallet,
+                token=token,
+                token_address=token_address,
+                token_id=token_id,
+                balance_raw=raw,
+                balance=human(raw),
+            )
         )
-
-        session.merge(item)
-
     session.commit()
 
 
@@ -180,23 +151,11 @@ def compare_balances(
     historical: dict,
     onchain: dict,
 ) -> list[dict]:
-
     keys = set(historical) | set(onchain)
-
     result = []
-
     for key in sorted(keys):
-
-        historical_raw = historical.get(
-            key,
-            0,
-        )
-
-        onchain_raw = onchain.get(
-            key,
-            0,
-        )
-
+        historical_raw = int(historical.get(key, 0))
+        onchain_raw = int(onchain.get(key, 0))
         result.append(
             {
                 "token": key[0],
@@ -204,11 +163,7 @@ def compare_balances(
                 "token_id": key[2],
                 "historical_raw": historical_raw,
                 "onchain_raw": onchain_raw,
-                "match": (
-                    historical_raw
-                    == onchain_raw
-                ),
+                "match": historical_raw == onchain_raw,
             }
         )
-
     return result

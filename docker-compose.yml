@@ -45,6 +45,9 @@ services:
       WALLET: ${WALLET}
       START_BLOCK: ${START_BLOCK}
       CHUNK_SIZE: ${CHUNK_SIZE}
+      PUSD_ADDRESS: ${PUSD_ADDRESS}
+      USDCE_ADDRESS: ${USDCE_ADDRESS}
+      CTF_ADDRESS: ${CTF_ADDRESS}
 
     depends_on:
       postgres:

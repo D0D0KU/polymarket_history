@@ -68,9 +68,11 @@ class WalletEvent(Base):
         nullable=False,
     )
 
-    token_id: Mapped[str | None] = mapped_column(
+    token_id: Mapped[str] = mapped_column(
         String(80),
-        nullable=True,
+        nullable=False,
+        default="",
+        server_default="",
     )
 
     amount_raw: Mapped[int] = mapped_column(
@@ -157,6 +159,7 @@ class WalletBalance(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
+        onupdate=func.now(),
         nullable=False,
     )
 
@@ -235,6 +238,11 @@ class WalletSync(Base):
         nullable=False,
     )
 
+    usdce_match: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+    )
+
     ctf_match: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
@@ -252,5 +260,31 @@ class WalletSync(Base):
 
     finished_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
+        nullable=False,
+    )
+
+
+class WalletScanProgress(Base):
+    __tablename__ = "wallet_scan_progress"
+
+    wallet: Mapped[str] = mapped_column(
+        String(42),
+        primary_key=True,
+    )
+
+    origin_block: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+    )
+
+    last_block: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
         nullable=False,
     )
